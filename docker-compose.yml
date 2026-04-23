@@ -1,0 +1,326 @@
+name: instay-prod
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  traefik:
+    image: traefik:v2.11
+    container_name: instay-traefik
+    restart: unless-stopped
+    command:
+      - "--global.checknewversion=false"
+      - "--global.sendanonymoususage=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--certificatesresolvers.le.acme.tlschallenge=true"
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--accesslog=true"
+      - "--log.level=${TRAEFIK_LOG_LEVEL:-INFO}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt_data:/letsencrypt
+    networks:
+      - public
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-ghcr.io/InstaySystem/is_v2-ai}
+    init: true
+    pull_policy: always
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: "1"
+    networks:
+      - public
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "instay_public"
+      traefik.http.routers.frontend.rule: "Host(`${FRONTEND_HOST}`)"
+      traefik.http.routers.frontend.entrypoints: "websecure"
+      traefik.http.routers.frontend.tls: "true"
+      traefik.http.routers.frontend.tls.certresolver: "le"
+      traefik.http.services.frontend.loadbalancer.server.port: "3000"
+    logging: *default-logging
+
+  backend:
+    image: ${BACKEND_IMAGE:-ghcr.io/InstaySystem/is_v2-be}
+    init: true
+    pull_policy: always
+    restart: unless-stopped
+    expose:
+      - "8080"
+    environment:
+      SV_PORT: 8080
+      SQL_HOST: postgres
+      SQL_PORT: 5432
+      SQL_USER: ${POSTGRES_USER}
+      SQL_PASSWORD: ${POSTGRES_PASSWORD}
+      SQL_DB_NAME: ${POSTGRES_DB}
+      SQL_SSL_MODE: disable
+      NOSQL_URI: mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@mongo:27017/${MONGO_DB_NAME}?authSource=admin
+      NOSQL_DB_NAME: ${MONGO_DB_NAME}
+      CA_HOST: redis
+      CA_PORT: 6379
+      CA_PASSWORD: ${REDIS_PASSWORD}
+      MQ_HOST: rabbitmq
+      MQ_PORT: 5672
+      MQ_USER: ${RABBITMQ_DEFAULT_USER}
+      MQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS}
+      MQ_VHOST: ${RABBITMQ_DEFAULT_VHOST:-/}
+      MQ_USE_SSL: "false"
+      SVC_AI_HOST: ai
+      SVC_AI_PORT: 50051
+    networks:
+      - public
+      - private
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "instay_public"
+      traefik.http.routers.backend.rule: "Host(`${BACKEND_HOST}`)"
+      traefik.http.routers.backend.entrypoints: "websecure"
+      traefik.http.routers.backend.tls: "true"
+      traefik.http.routers.backend.tls.certresolver: "le"
+      traefik.http.middlewares.backend-security.headers.stsSeconds: "31536000"
+      traefik.http.middlewares.backend-security.headers.stsIncludeSubdomains: "true"
+      traefik.http.middlewares.backend-security.headers.forceSTSHeader: "true"
+      traefik.http.middlewares.backend-security.headers.contentTypeNosniff: "true"
+      traefik.http.middlewares.backend-security.headers.frameDeny: "true"
+      traefik.http.middlewares.backend-compress.compress: "true"
+      traefik.http.routers.backend.middlewares: "backend-security,backend-compress"
+      traefik.http.services.backend.loadbalancer.server.port: "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      ai:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    logging: *default-logging
+
+  ai:
+    image: ${AI_IMAGE:-ghcr.io/InstaySystem/is_v2-ai}
+    init: true
+    pull_policy: always
+    restart: unless-stopped
+    expose:
+      - "50051"
+    environment:
+      SV_HOST: 0.0.0.0
+      SV_PORT: 50051
+      SERVER_HOST: backend
+      SERVER_PORT: 8080
+    networks:
+      - private
+    healthcheck:
+      test:
+        - CMD
+        - /opt/venv/bin/python
+        - -c
+        - import os,grpc; from proto.gen.ai import ai_pb2,ai_pb2_grpc; port=os.getenv("SV_PORT","50051"); ch=grpc.insecure_channel(f"127.0.0.1:{port}"); ai_pb2_grpc.AIServiceStub(ch).Ping(ai_pb2.PingRequest(), timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    logging: *default-logging
+
+  cqa:
+    image: ${CQA_IMAGE:-ghcr.io/InstaySystem/is_v2-cqa}
+    init: true
+    pull_policy: always
+    restart: unless-stopped
+    expose:
+      - "8081"
+    environment:
+      APP_ENV: production
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8081
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: ${MYSQL_USER}
+      DB_PASSWORD: ${MYSQL_PASSWORD}
+      DB_NAME: ${MYSQL_DATABASE}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      JWT_SECRET: ${CQA_JWT_SECRET}
+      ENCRYPTION_KEY: ${CQA_ENCRYPTION_KEY}
+    networks:
+      - public
+      - cqa
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "instay_public"
+      traefik.http.routers.cqa.rule: "Host(`${CQA_HOST}`)"
+      traefik.http.routers.cqa.entrypoints: "websecure"
+      traefik.http.routers.cqa.tls: "true"
+      traefik.http.routers.cqa.tls.certresolver: "le"
+      traefik.http.services.cqa.loadbalancer.server.port: "8081"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    logging: *default-logging
+
+  postgres:
+    image: postgres:17.9-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    expose:
+      - "5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - private
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+
+  mysql:
+    image: mysql:8.4.8
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    expose:
+      - "3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - cqa
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging: *default-logging
+
+  mongo:
+    image: mongo:7.0-jammy
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+    expose:
+      - "27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - private
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh mongodb://$$MONGO_INITDB_ROOT_USERNAME:$$MONGO_INITDB_ROOT_PASSWORD@127.0.0.1:27017/admin --eval 'db.runCommand({ ping: 1 })' --quiet",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 30s
+    logging: *default-logging
+
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - private
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging: *default-logging
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_DEFAULT_VHOST:-/}
+    expose:
+      - "5672"
+      - "15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - private
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging: *default-logging
+
+networks:
+  public:
+    name: instay_public
+    driver: bridge
+  private:
+    name: instay_private
+    driver: bridge
+    internal: true
+  cqa:
+    name: instay_cqa
+    driver: bridge
+    internal: true
+
+volumes:
+  letsencrypt_data:
+    driver: local
+  postgres_data:
+    driver: local
+  mysql_data:
+    driver: local
+  mongo_data:
+    driver: local
+  redis_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
